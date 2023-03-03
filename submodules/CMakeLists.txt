@@ -130,7 +130,7 @@ if (WIN32)
         OUTPUT $<IF:$<CONFIG:Debug>,${LIBCRYPTO_DEBUG_PATH},${LIBCRYPTO_PATH}>
         DEPENDS $<IF:$<CONFIG:Debug>,${QUIC_BUILD_DIR}/submodules/openssl/debug/makefile,${QUIC_BUILD_DIR}/submodules/openssl/release/makefile>
         WORKING_DIRECTORY $<IF:$<CONFIG:Debug>,${QUIC_BUILD_DIR}/submodules/openssl/debug,${QUIC_BUILD_DIR}/submodules/openssl/release>
-        COMMAND ${OPENSSL_RUN_COMMAND} install_dev
+        COMMAND ${OPENSSL_RUN_COMMAND}
         COMMENT "OpenSSL build"
     )
 
@@ -243,10 +243,13 @@ else()
         endif()
     elseif(CX_PLATFORM STREQUAL "darwin")
         # need to build with Apple's compiler
+        message(INFO "arch ${CMAKE_OSX_ARCHITECTURES}")
         if (CMAKE_OSX_ARCHITECTURES STREQUAL arm64)
-            set(OPENSSL_CONFIG_CMD ARCHFLAGS="-arch arm64" ${CMAKE_CURRENT_SOURCE_DIR}/openssl/Configure darwin64-arm64-cc)
+            set(platforms arm64)
         elseif(CMAKE_OSX_ARCHITECTURES STREQUAL x86_64)
-            set(OPENSSL_CONFIG_CMD ARCHFLAGS="-arch x86_64" ${CMAKE_CURRENT_SOURCE_DIR}/openssl/Configure darwin64-x86_64-cc)
+            set(platforms x86_64)
+        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64;arm64")
+            set(platforms x86_64 arm64)
         else()
             message(ERROR "WTF ${CX_PLATFORM} ${CMAKE_TARGET_ARCHITECTURE}")
             set(OPENSSL_CONFIG_CMD ${CMAKE_CURRENT_SOURCE_DIR}/openssl/config)
@@ -265,31 +268,71 @@ else()
             CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER})
     endif()
 
-    # Create working and output directories as needed
-    file(MAKE_DIRECTORY ${OPENSSL_DIR}/include)
+    # Target to export to parent project
+    add_library(OpenSSLQuic INTERFACE)
+    add_dependencies(OpenSSLQuic
+        OpenSSL_Target)
+
     file(MAKE_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl)
 
-    # Configure steps for debug and release variants
-    add_custom_command(
-        WORKING_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl
-        OUTPUT ${QUIC_BUILD_DIR}/submodules/openssl/Makefile
-        COMMAND SYSTEM=${CMAKE_HOST_SYSTEM_NAME}
-            ${OPENSSL_CONFIG_CMD} ${OPENSSL_CONFIG_FLAGS}
-        COMMENT "OpenSSL configure"
-    )
+    foreach(platform ${platforms})
+        set(OPENSSL_CONFIG_CMD ARCHFLAGS="-arch ${platform}" ${CMAKE_CURRENT_SOURCE_DIR}/openssl/Configure darwin64-${platform}-cc)
+        message("building for ${OPENSSL_CONFIG_CMD}")
 
-    include(ProcessorCount)
-    ProcessorCount(NPROCS)
+        # Create working and output directories as needed
+        file(MAKE_DIRECTORY ${OPENSSL_DIR}_${platform}/include)
+        file(MAKE_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl_${platform})
+        set(OPENSSL_CONFIG_FLAGS "--prefix ${QUIC_BUILD_DIR}/submodules/openssl_${platform}")
+        message("building in ${QUIC_BUILD_DIR}/submodules/openssl_${platform} with cmd ${OPENSSL_CONFIG_CMD} ${OPENSSL_CONFIG_FLAGS}")
 
-    message(STATUS "Configuring OpenSSL: ${OPENSSL_CONFIG_CMD} ${OPENSSL_CONFIG_FLAGS}")
-    # Compile/install commands for debug and release variants
+        # Configure steps for debug and release variants
+        add_custom_command(
+            WORKING_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl_${platform}
+            OUTPUT ${QUIC_BUILD_DIR}/submodules/openssl_${platform}/Makefile
+            COMMAND SYSTEM=${CMAKE_HOST_SYSTEM_NAME}
+                ${OPENSSL_CONFIG_CMD} ${OPENSSL_CONFIG_FLAGS}
+            COMMENT "OpenSSL configure"
+        )
+
+        include(ProcessorCount)
+        ProcessorCount(NPROCS)
+
+        set(libcrypto ${QUIC_BUILD_DIR}/submodules/openssl_${platform}/libcrypto.a)
+        set(libssl ${QUIC_BUILD_DIR}/submodules/openssl_${platform}/libssl.a)
+
+        # Compile/install commands for debug and release variants
+        add_custom_command(
+            OUTPUT ${libcrypto}
+            OUTPUT ${libssl}
+            DEPENDS ${QUIC_BUILD_DIR}/submodules/openssl_${platform}/Makefile
+            WORKING_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl_${platform}
+            COMMAND make -j${NPROCS}
+            COMMENT "OpenSSL build"
+        )
+
+        target_include_directories(
+            OpenSSLQuic
+            INTERFACE
+            ${CMAKE_CURRENT_SOURCE_DIR}/openssl/include
+            ${QUIC_BUILD_DIR}/submodules/openssl_${platform}/include
+        )
+
+    endforeach()
+
+    set(libcryptos ${QUIC_BUILD_DIR}/submodules/openssl_x86_64/libcrypto.a
+                   ${QUIC_BUILD_DIR}/submodules/openssl_arm64/libcrypto.a)
+    set(libssls ${QUIC_BUILD_DIR}/submodules/openssl_x86_64/libssl.a
+                   ${QUIC_BUILD_DIR}/submodules/openssl_arm64/libssl.a)
+
     add_custom_command(
         OUTPUT ${LIBSSL_PATH}
         OUTPUT ${LIBCRYPTO_PATH}
-        DEPENDS ${QUIC_BUILD_DIR}/submodules/openssl/Makefile
+        DEPENDS ${libssls}
+        DEPENDS ${libcryptos}
         WORKING_DIRECTORY ${QUIC_BUILD_DIR}/submodules/openssl
-        COMMAND make install_dev -j${NPROCS}
-        COMMENT "OpenSSL build"
+        COMMAND lipo -create ${libcryptos} -output ${LIBCRYPTO_PATH}
+        COMMAND lipo -create ${libssls} -output ${LIBSSL_PATH}
+        COMMENT "OpenSSL lipo step"
     )
 
     # Named target depending on the final lib artifacts produced by custom commands
@@ -301,41 +344,18 @@ else()
     )
     set_property(TARGET OpenSSL_Target PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}helpers")
 
-    # Target to export to parent project
-    add_library(OpenSSLQuic INTERFACE)
-    add_dependencies(OpenSSLQuic
-        OpenSSL_Target)
-    target_include_directories(
-        OpenSSLQuic
-        INTERFACE
-        ${OPENSSL_DIR}/include
-    )
-
     target_link_libraries(
         OpenSSLQuic
         INTERFACE
         ${LIBSSL_PATH}
     )
-
-    if (QUIC_USE_SYSTEM_LIBCRYPTO)
-        include(FindOpenSSL)
-        if (OPENSSL_FOUND)
-            if (OPENSSL_VERSION VERSION_EQUAL EXPECTED_OPENSSL_VERSION)
-                target_link_libraries(OpenSSLQuic INTERFACE OpenSSL::Crypto)
-            else()
-                message(FATAL_ERROR "OpenSSL ${EXPECTED_OPENSSL_VERSION} not found, found ${OPENSSL_VERSION}")
-            endif()
-        else()
-            message(FATAL_ERROR "System OpenSSL not found when requested")
-        endif()
-    else()
-        target_link_libraries(
-            OpenSSLQuic
-            INTERFACE
-            ${LIBCRYPTO_PATH}
-        )
-    endif()
+    target_link_libraries(
+        OpenSSLQuic
+        INTERFACE
+        ${LIBCRYPTO_PATH}
+    )
 
     add_library(OpenSSLQuic::OpenSSLQuic ALIAS OpenSSLQuic)
+
 
 endif()
